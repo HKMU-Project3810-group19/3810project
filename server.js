@@ -5,7 +5,9 @@ const cookieParser = require('cookie-parser');
 const session = require('express-session');
 const methodOverride = require('method-override');
 const { MongoClient, ObjectId } = require('mongodb');
-const { getSystemErrorMap } = require('util');
+const passport = require('passport');
+const LocalStrategy = require('passport-local').Strategy;
+const bcrypt = require('bcrypt');
 
 const app = express();
 const port = 3000;
@@ -21,33 +23,90 @@ app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 app.use(cookieParser());
 app.use(session({
-    secret: 'abc123!@#', // Replace with a strong secret key
+    secret: 'abc123!@#',
     resave: false,
     saveUninitialized: false,
     cookie: {
-        secure: process.env.NODE_ENV === 'production', // Use HTTPS in production
-        httpOnly: true, // Prevent client-side access to cookies
-        sameSite: 'strict', // Prevent CSRF
+        secure: false,
+        httpOnly: true,
+        sameSite: 'strict',
         maxAge: 1 * 60 * 60 * 1000 // 1 hour
     }
 }));
+app.use(passport.initialize());
+app.use(passport.session());
 app.use(express.static(path.join(__dirname, 'public')));
-
 
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 app.use(methodOverride('_method'));
 
-// Utility functions
-async function findUserByField(db, field, value) {
-    return await db.collection(collection_user).findOne({ [field]: value });
-}
+passport.use(new LocalStrategy(
+    { usernameField: 'email' },
+    async (email, password, done) => {
+        try {
+            await client.connect();
+            const db = client.db(dbName);
+            const user = await db.collection(collection_user).findOne({ email });
 
-function ensureAuthenticated(req, res, next) {
-    if (req.session.user) {
+            if (!user) {
+                console.log('No user with that email');
+                return done(null, false, { message: 'No user with that email' });
+            }
+
+            const passwordMatch = await bcrypt.compare(password, user.password);
+            if (!passwordMatch) {
+                console.log('Incorrect password');
+                return done(null, false, { message: 'Incorrect password' });
+            }
+
+            console.log('User authenticated successfully:', user);
+            return done(null, user);
+        } catch (err) {
+            console.error('Error in LocalStrategy:', err);
+            return done(err);
+        }
+    }
+));
+
+// Serialize and Deserialize User
+passport.serializeUser((user, done) => {
+    console.log('Serializing user:', user._id);
+    done(null, user._id); 
+});
+
+passport.deserializeUser(async (id, done) => {
+    console.log('Deserializing user ID:', id);
+    try {
+        const db = client.db(dbName);
+        const user = await db.collection(collection_user).findOne({ _id: new ObjectId(id) });
+        console.log('User after deserialization:', user);
+        done(null, user); 
+    } catch (error) {
+        console.error('Error during deserialization:', error);
+        done(error, null);
+    }
+});
+
+// Authentication ensure
+const ensureAuthenticated = (req, res, next) => {
+    console.log('User authenticated?', req.isAuthenticated()); 
+    if (req.isAuthenticated()) {
         return next();
     }
     res.redirect('/login');
+};
+
+const checkLoggedIn = (req, res, next) => {
+    if (req.isAuthenticated()) { 
+        return res.redirect("/home")
+    }
+    next()
+}
+
+// Utility functions
+async function findUserByField(db, field, value) {
+    return await db.collection(collection_user).findOne({ [field]: value });
 }
 
 // Routes
@@ -63,59 +122,58 @@ app.get('/contact', (req, res) => {
     res.status(200).render('contact', { title: "Contact Us" });
 });
 
-app.get('/home', ensureAuthenticated, (req, res) => {
+app.get('/home',ensureAuthenticated ,(req,res) => {
     res.status(200).render('home', { title: "Home page" });
 });
 
-app.get('/login', (req, res) => {
+app.get('/login',checkLoggedIn, (req, res) => {
     res.status(200).render('login', { title: "Login" });
 });
 
-app.get('/logout', (req, res) => {
-    // Destroy the session
-    req.session.destroy(err => {
+app.post('/login', (req, res, next) => {
+    passport.authenticate('local', (err, user, info) => {
         if (err) {
-            console.error('Error destroying session:', err);
-            return res.status(500).send('Error logging out.');
+            console.error('Error during authentication:', err);
+            return next(err);
         }
 
-        // Clear any cookies related to the session
-        res.clearCookie('connect.sid'); // Default cookie name for express-session
-        res.redirect('/'); // Redirect to index page
-    });
+        if (!user) {
+            console.log('Authentication failed:', info);
+            return res.status(401).render('login', { error: 'Invalid email or password' });
+        }
+
+        req.logIn(user, (err) => {
+            if (err) {
+                console.error('Error logging in:', err);
+                return next(err);
+            }
+
+            console.log('Authentication successful:', user);
+            res.redirect('/home'); 
+        });
+    })(req, res, next);
 });
 
-app.get('/signup', (req, res) => {
-    res.status(200).render('signup', { title: "Create an Account" });
+app.get('/logout', (req, res) => {
+    req.logout(err => {
+        if (err) {
+            console.error('Error logging out:', err);
+            return res.status(500).send('Error logging out.');
+        }
+        res.redirect('/');
+    });
 });
 
 app.get('/reset', (req, res) => {
     res.status(200).render('reset', { title: "Reset Password" });
 });
 
-// User Authentication
-app.post('/logining', async (req, res) => {
-    const { email, password } = req.body;
-    try {
-        await client.connect();
-        const db = client.db(dbName);
-        const user = await findUserByField(db, 'email', email);
-        console.log("Logining");
-        if (user && user.password === password) {
-            req.session.user = email; // Store user email in session
-            console.log("Login success");
-            res.redirect('/home');
-        } else {
-            console.log("Invalid email or password");
-            res.status(401).render('login', { error: 'Invalid email or password' });
-        }
-    } catch (err) {
-        console.error(err);
-        res.status(500).render('login', { error: 'An error occurred. Please try again.' });
-    }
+//sign up
+app.get('/signup', (req, res) => {
+    res.status(200).render('signup', { title: "Create an Account" });
 });
 
-app.post('/signuping', async (req, res) => {
+app.post('/signup', async (req, res) => {
     const { username, email, password, password_comfirm } = req.body;
 
     if (password !== password_comfirm) {
@@ -126,19 +184,21 @@ app.post('/signuping', async (req, res) => {
         await client.connect();
         const db = client.db(dbName);
 
-        const usernameExists = await findUserByField(db, 'name', username);
-        const emailExists = await findUserByField(db, 'email', email);
+        const usernameExists = await db.collection(collection_user).findOne({ name: username });
+        const emailExists = await db.collection(collection_user).findOne({ email });
 
         if (usernameExists || emailExists) {
             return res.status(400).render('signup', { error: 'Username or email already in use' });
         }
+
+        const hashedPassword = await bcrypt.hash(password, 10); 
 
         const userCount = await db.collection(collection_user).countDocuments();
         const newUser = {
             userID: userCount + 1,
             name: username,
             email,
-            password
+            password: hashedPassword =
         };
 
         await db.collection(collection_user).insertOne(newUser);
@@ -181,9 +241,10 @@ app.post('/reset', async (req, res) => {
     }
 });
 
+
 // API Endpoints
 // Route to fetch and display editable student data
-app.get('/edit', ensureAuthenticated, async (req, res) => {
+app.get('/edit',ensureAuthenticated, async (req, res) => {
     try {
         await client.connect();
         const db = client.db(dbName);
@@ -205,7 +266,7 @@ app.get('/edit', ensureAuthenticated, async (req, res) => {
     }
 });
 
-app.post('/edit/saveAll', ensureAuthenticated,async (req, res) => {
+app.post('/edit/saveAll',ensureAuthenticated,async (req, res) => {
     const studentUpdates = req.body.students;  
 
     if (!studentUpdates || typeof studentUpdates !== 'object') {
@@ -257,7 +318,7 @@ app.post('/edit/saveAll', ensureAuthenticated,async (req, res) => {
 });
 
 // Route to handle adding a new student
-app.post('/edit/add', ensureAuthenticated,async (req, res) => {
+app.post('/edit/add',ensureAuthenticated,async (req, res) => {
     try {
         const { ClassID, SID, 'First name': firstName, 'Last name': lastName, Gender, age, 'Home address': homeAddress, 'phone address': phone, Credit } = req.body;
 
@@ -290,7 +351,7 @@ app.post('/edit/add', ensureAuthenticated,async (req, res) => {
 });
 
 // Route to delete a student record
-app.delete('/edit/delete/:id', ensureAuthenticated,async (req, res) => {
+app.delete('/edit/delete/:id',ensureAuthenticated,async (req, res) => {
     try {
         const studentId = req.params.id;
         await client.connect();
@@ -304,7 +365,7 @@ app.delete('/edit/delete/:id', ensureAuthenticated,async (req, res) => {
     }
 });
 
-app.put('/edit/update/:id', (req, res) => {
+app.put('/edit/update/:id',ensureAuthenticated, (req, res) => {
     const studentId = req.params.id; // Get the student ID from the URL
     const updatedData = req.body; // Get the updated student data from the request body
 
@@ -328,7 +389,7 @@ app.put('/edit/update/:id', (req, res) => {
 
 
 // Add a GET route for login
-app.get('/home', ensureAuthenticated,(req, res) => {
+app.get('/home',ensureAuthenticated,(req, res) => {
     if (req.session.user) {
         res.status(200).render('home', { title: "Home page", user: req.session.user });
 
